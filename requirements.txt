@@ -1,3 +1,4 @@
+torch-geometric
 timer
 pandas
 numpy

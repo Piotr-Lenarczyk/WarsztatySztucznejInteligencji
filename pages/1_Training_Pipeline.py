@@ -1,3 +1,5 @@
+import streamlit as st
+
 import json
 import os
 import random
@@ -5,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
 
-import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -22,7 +23,15 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GINEConv, global_mean_pool, global_max_pool, JumpingKnowledge
 
 
-# Configuration class
+st.set_page_config(page_title="GINE Training Pipeline")
+st.sidebar.header("GINE Training Pipeline")
+
+
+def show_saved_plot(image_path: Path, title: str):
+    if image_path.exists():
+        st.subheader(title)
+        st.image(str(image_path), use_container_width=True)
+
 class Config:
     seed = 42
     target_id = "CHEMBL2147"
@@ -57,10 +66,19 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# EDA pipeline
-def run_full_eda(df: pd.DataFrame):
+def update_progress(progress_bar, status_placeholder, progress_fraction: float, message: str):
+    if progress_bar is not None:
+        progress_bar.progress(max(0, min(1, progress_fraction)))
+    if status_placeholder is not None:
+        status_placeholder.write(message)
+
+def run_full_eda(df: pd.DataFrame, progress_bar=None, status_placeholder=None, start_fraction: float = 0.0, end_fraction: float = 0.3):
     setup_dirs()
-    print("--- Running Production Quality EDA Suite ---")
+    st.write("--- Running EDA ---")
+
+    step_span = end_fraction - start_fraction
+    step_count = 4
+    step_idx = 0
 
     numeric_df = df.select_dtypes(include=[np.number])
     if not numeric_df.empty:
@@ -69,6 +87,9 @@ def run_full_eda(df: pd.DataFrame):
         plt.title('Correlation Analysis Matrix')
         plt.savefig(str(Config.plots_dir / "eda_correlation.png"))
         plt.close()
+        show_saved_plot(Config.plots_dir / "eda_correlation.png", "EDA: Correlation analysis")
+    step_idx += 1
+    update_progress(progress_bar, status_placeholder, start_fraction + step_span * step_idx / step_count, "EDA: correlation analysis done")
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     sns.histplot(df["standard_value"], bins=50, ax=axes[0], kde=True, log_scale=True)
@@ -77,6 +98,9 @@ def run_full_eda(df: pd.DataFrame):
     axes[1].set_title("Standardized pIC50 Distribution Profile")
     plt.savefig(str(Config.plots_dir / "eda_distributions.png"))
     plt.close()
+    show_saved_plot(Config.plots_dir / "eda_distributions.png", "EDA: Distributions")
+    step_idx += 1
+    update_progress(progress_bar, status_placeholder, start_fraction + step_span * step_idx / step_count, "EDA: distributions done")
 
     def calc_lipinski(smi):
         mol = Chem.MolFromSmiles(smi)
@@ -94,6 +118,9 @@ def run_full_eda(df: pd.DataFrame):
     plt.title("Lipinski Rules Structural Violation Profile")
     plt.savefig(str(Config.plots_dir / "eda_lipinski_violations.png"))
     plt.close()
+    show_saved_plot(Config.plots_dir / "eda_lipinski_violations.png", "EDA: Lipinski violations")
+    step_idx += 1
+    update_progress(progress_bar, status_placeholder, start_fraction + step_span * step_idx / step_count, "EDA: Lipinski analysis done")
 
     df["scaffold"] = df["smiles"].apply(lambda s: MurckoScaffold.MurckoScaffoldSmiles(mol=Chem.MolFromSmiles(s)) if Chem.MolFromSmiles(s) else None)
     scaff_counts = df["scaffold"].value_counts().head(10)
@@ -102,8 +129,10 @@ def run_full_eda(df: pd.DataFrame):
     if mols:
         img = Draw.MolsToGridImage(mols, molsPerRow=5, legends=[f"Count: {c}" for c in scaff_counts.values])
         img.save(str(Config.plots_dir / "eda_top_scaffolds.png"))
+        show_saved_plot(Config.plots_dir / "eda_top_scaffolds.png", "EDA: Top scaffolds")
+    update_progress(progress_bar, status_placeholder, end_fraction, "EDA: finished")
 
-# Structural graph encoding
+
 def get_advanced_atom_features(atom: Chem.Atom) -> List[float]:
     features = []
     features.extend([float(atom.GetAtomicNum() == i) for i in [1, 5, 6, 7, 8, 9, 15, 16, 17, 35, 53]])
@@ -154,13 +183,14 @@ def smiles_to_advanced_graph(smiles: str, y_val: float, global_desc: List[float]
 
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, g_desc=g_desc)
 
-# GIN model
+
 class AttentionalGINEModel(nn.Module):
     def __init__(self, in_channels, cfg):
         super().__init__()
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
 
+        # Deep contextual GINE blocks
         for i in range(cfg.num_layers):
             dim = in_channels if i == 0 else cfg.hidden_dim
             mlp = nn.Sequential(
@@ -172,7 +202,7 @@ class AttentionalGINEModel(nn.Module):
             self.convs.append(GINEConv(mlp, edge_dim=cfg.edge_dim))
             self.bns.append(nn.BatchNorm1d(cfg.hidden_dim))
 
-        # Adaptive Jumping Knowledge Fusion Architecture (LSTM/Max routing)
+        # Upgrade: Adaptive Jumping Knowledge Fusion Architecture (LSTM/Max routing)
         self.jk = JumpingKnowledge(mode='lstm', channels=cfg.hidden_dim, num_layers=cfg.num_layers)
 
         self.head = nn.Sequential(
@@ -194,10 +224,8 @@ class AttentionalGINEModel(nn.Module):
             x = F.dropout(x, p=0.2, training=self.training)
             xs.append(x)
 
-        # Extract hierarchical multi-scale neighborhood matrices
         x_jk = self.jk(xs)
 
-        # Symmetric multi-resolution feature pooling
         pool_mean = global_mean_pool(x_jk, batch)
         pool_max = global_max_pool(x_jk, batch)
 
@@ -231,13 +259,11 @@ def evaluate_gnn_metrics(model: nn.Module, loader: DataLoader, device: str, y_sc
 
     return {"mse": mse, "rmse": float(np.sqrt(mse)), "mae": float(np.mean(np.abs(p - y))), "r2": r2}
 
-#Training pipeline
-def run_training_pipeline(df_raw: pd.DataFrame):
-    import joblib
+
+def run_training_pipeline(df_raw: pd.DataFrame, progress_bar=None, status_placeholder=None, start_fraction: float = 0.3, end_fraction: float = 1.0):
     setup_dirs()
     seed_everything(Config.seed)
 
-    # Clean outliers
     df_raw = df_raw[(df_raw['pchembl_value'] >= 3.0) & (df_raw['pchembl_value'] <= 12.0)].copy()
 
     df = df_raw.groupby('smiles').agg({
@@ -245,22 +271,19 @@ def run_training_pipeline(df_raw: pd.DataFrame):
         'heavy_atoms': 'first',
         'lipinski_violations': 'first'
     }).reset_index()
-    print(f"Unique compounds remaining for training: {len(df)}")
+    st.write(f"Unique components remaining for training: {len(df)}")
 
-    # Normalize features
     scaler_g = StandardScaler()
     df[['heavy_atoms', 'lipinski_violations']] = scaler_g.fit_transform(df[['heavy_atoms', 'lipinski_violations']])
-
-    # Save the global macro feature descriptor scaler
-    joblib.dump(scaler_g, Config.plots_dir / "GNN" / "global_descriptor_scaler.pkl")
+    update_progress(progress_bar, status_placeholder, start_fraction + 0.05 * (end_fraction - start_fraction), "Training: feature normalization done")
 
     dataset = []
     for _, row in df.iterrows():
         g_desc = [float(row['heavy_atoms']), float(row['lipinski_violations'])]
         g = smiles_to_graph_data = smiles_to_advanced_graph(row['smiles'], row['pchembl_value'], g_desc)
         if g: dataset.append(g)
+    update_progress(progress_bar, status_placeholder, start_fraction + 0.15 * (end_fraction - start_fraction), "Training: graph featurization done")
 
-    # Scaffolds
     scaffs = {}
     for i, g in enumerate(dataset):
         s = MurckoScaffold.MurckoScaffoldSmiles(mol=Chem.MolFromSmiles(df.iloc[i]['smiles']))
@@ -274,14 +297,11 @@ def run_training_pipeline(df_raw: pd.DataFrame):
         if len(train_idx) < 0.8 * len(dataset): train_idx.extend(ids)
         elif len(val_idx) < 0.1 * len(dataset): val_idx.extend(ids)
         else: test_idx.extend(ids)
+    update_progress(progress_bar, status_placeholder, start_fraction + 0.25 * (end_fraction - start_fraction), "Training: scaffold split done")
 
     scaler_y = StandardScaler()
     train_y = np.array([dataset[i].y.item() for i in train_idx]).reshape(-1, 1)
     scaler_y.fit(train_y)
-
-    import joblib
-    joblib.dump(scaler_y, Config.plots_dir / "GNN" / "fitted_scaler.pkl")
-    print(f"Target scaler successfully serialized and saved to: {Config.plots_dir / 'GNN' / 'fitted_scaler.pkl'}")
 
     def get_loader(idxs, shuffle=False):
         data_list = []
@@ -294,13 +314,12 @@ def run_training_pipeline(df_raw: pd.DataFrame):
     train_loader = get_loader(train_idx, True)
     val_loader = get_loader(val_idx)
     test_loader = get_loader(test_idx)
+    update_progress(progress_bar, status_placeholder, start_fraction + 0.3 * (end_fraction - start_fraction), "Training: data loaders ready")
 
-    # Optimizer
     model = AttentionalGINEModel(dataset[0].x.size(1), Config).to(Config.device)
     opt = torch.optim.Adam(model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay)
     crit = nn.MSELoss()
 
-    # Dynamic Learning Rate Schedulers
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='max', factor=0.5, patience=2, min_lr=1e-5
     )
@@ -314,7 +333,8 @@ def run_training_pipeline(df_raw: pd.DataFrame):
         "train_r2": [], "val_r2": [], "test_r2": [], "lr": []
     }
 
-    print("\n--- Model Training Routine Initiated ---")
+    st.write("\n--- Model Training... ---")
+    num_epochs = Config.epochs
     for epoch in range(Config.epochs):
         model.train()
         for batch in train_loader:
@@ -335,26 +355,28 @@ def run_training_pipeline(df_raw: pd.DataFrame):
             history[f"val_{k}"].append(val_metrics[k])
             history[f"test_{k}"].append(test_metrics[k])
 
-        print(f"Epoch {epoch+1:02d} | Train R2: {train_metrics['r2']:.3f} | Val R2: {val_metrics['r2']:.4f} | Test R2: {test_metrics['r2']:.4f} | LR: {current_lr}")
+        st.write(f"Epoch {epoch+1:02d} | Train R2: {train_metrics['r2']:.3f} | Val R2: {val_metrics['r2']:.4f} | Test R2: {test_metrics['r2']:.4f} | LR: {current_lr}")
 
         scheduler.step(val_metrics['r2'])
+
+        training_fraction = start_fraction + 0.35 * (end_fraction - start_fraction)
+        remaining_fraction = end_fraction - training_fraction
+        epoch_progress = training_fraction + remaining_fraction * ((epoch + 1) / max(1, num_epochs))
+        update_progress(progress_bar, status_placeholder, epoch_progress, "Training in progress...")
+
 
         if val_metrics['r2'] > best_r2:
             best_r2 = val_metrics['r2']
             patience = 0
             torch.save(model.state_dict(), Config.plots_dir / "GNN" / "best_gine_model.pt")
-            # persist scaler_y alongside the best model for later inference
-            try:
-                joblib.dump(scaler_y, Config.plots_dir / "GNN" / "y_scaler.joblib")
-            except Exception as e:
-                print(f"Warning: failed to persist y-scaler: {e}")
         else:
             patience += 1
             if patience >= Config.early_stopping_patience:
-                print("Early stopping sequence executed.")
+                st.write("Early stopping sequence executed.")
                 break
 
-    # Historical files
+    update_progress(progress_bar, status_placeholder, start_fraction + 0.92 * (end_fraction - start_fraction), "Training: saving metrics and plots")
+
     try:
         with open(Config.plots_dir / "GNN" / f"gine_history_{Config.timestamp}.json", "w") as fh:
             json.dump(history, fh, indent=4)
@@ -363,7 +385,7 @@ def run_training_pipeline(df_raw: pd.DataFrame):
         plt.plot(history["epoch"], history["train_r2"], label="Train R2", marker='o')
         plt.plot(history["epoch"], history["val_r2"], label="Val R2", marker='o')
         plt.plot(history["epoch"], history["test_r2"], label="Test R2", marker='o')
-        plt.xlabel("Epochs"); plt.ylabel("R2 Range"); plt.title("R2 Convergence")
+        plt.xlabel("Epochs"); plt.ylabel("R2 Range"); plt.title("Production GINE Attentional Profile - R2 Convergence")
         plt.legend(); plt.grid(); plt.savefig(str(Config.plots_dir / "GNN" / f"gine_r2_{Config.timestamp}.png"))
 
         plt.figure(figsize=(10, 5))
@@ -388,9 +410,13 @@ def run_training_pipeline(df_raw: pd.DataFrame):
         plt.legend(); plt.grid(); plt.savefig(str(Config.plots_dir / "GNN" / f"gine_mae_{Config.timestamp}.png"))
 
         plt.close()
-        print("\nOptimization execution terminated. Training telemetry recorded.")
+        show_saved_plot(Config.plots_dir / "GNN" / f"gine_r2_{Config.timestamp}.png", "Training: R2 convergence")
+        show_saved_plot(Config.plots_dir / "GNN" / f"gine_rmse_{Config.timestamp}.png", "Training: RMSE convergence")
+        show_saved_plot(Config.plots_dir / "GNN" / f"gine_mse_{Config.timestamp}.png", "Training: MSE convergence")
+        show_saved_plot(Config.plots_dir / "GNN" / f"gine_mae_{Config.timestamp}.png", "Training: MAE convergence")
+        st.write("\nOptimization execution terminated  Training telemetry recorded.")
     except Exception as e:
-        print("Telemetry graphing failure:", e)
+        st.write("Telemetry graphing failure:", e)
 
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 
@@ -414,7 +440,7 @@ def calculate_virtual_auc(model, loader, device, scaler_y, activity_threshold=7.
 
     # Safety check: ensure both classes exist in the test split
     if len(np.unique(y_true_binary)) < 2:
-        print("AUC calculation skipped: Subset does not contain both active and inactive examples.")
+        st.write("AUC calculation skipped: Subset does not contain both active and inactive examples.")
         return None
 
     # 1. ROC-AUC Score (Probability of ranking a true active above a true inactive)
@@ -424,164 +450,21 @@ def calculate_virtual_auc(model, loader, device, scaler_y, activity_threshold=7.
     precision, recall, _ = precision_recall_curve(y_true_binary, p)
     pr_auc = auc(recall, precision)
 
-    print(f"--- Virtual Classification Metrics (Threshold pIC50 >= {activity_threshold}) ---")
-    print(f"ROC-AUC: {roc_auc:.4f}")
-    print(f"PR-AUC:  {pr_auc:.4f}")
+    st.write(f"--- Virtual Classification Metrics (Threshold pIC50 >= {activity_threshold}) ---")
+    st.write(f"ROC-AUC: {roc_auc:.4f}")
+    st.write(f"PR-AUC:  {pr_auc:.4f}")
 
     return roc_auc, pr_auc
 
-def _load_y_scaler(possible_paths=None):
-    """Try to locate and load a persisted y-scaler (StandardScaler) used during training.
-    Returns scaler object or None if not found."""
-    if possible_paths is None:
-        possible_paths = [
-            Config.plots_dir / "GNN" / "scaler_y.pkl",
-            Config.plots_dir / "GNN" / "y_scaler.pkl",
-            Config.plots_dir / "GNN" / "scaler_y.joblib",
-            Config.plots_dir / "GNN" / "y_scaler.joblib",
-        ]
-    for p in possible_paths:
-        try:
-            if p.exists():
-                return joblib.load(p)
-        except Exception:
-            continue
-    return None
 
-
-def _find_latest_saved_model(runs_root: Optional[Path] = None) -> Optional[Path]:
-    """Search plots/runs for the most recent folder containing GNN/best_gine_model.pt and return its path."""
-    runs_root = runs_root or (Path("plots").resolve() / "runs")
-    if not runs_root.exists():
-        return None
-    candidates = []
-    for child in runs_root.iterdir():
-        if child.is_dir():
-            candidate = child / "GNN" / "best_gine_model.pt"
-            if candidate.exists():
-                candidates.append((child.stat().st_mtime, candidate))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
-
-
-def load_trained_gnn(in_channels: int = 34) -> nn.Module:
-    """Loads a fully compiled model architecture with trained state dict weights."""
-    model = AttentionalGINEModel(in_channels=in_channels, cfg=Config)
-
-    # Primary look-up check targeting the production directory
-    prod_weights = Config.PRODUCTION_DIR / "best_gine_model.pt"
-    if prod_weights.exists():
-        model.load_state_dict(torch.load(prod_weights, map_location=Config.device))
-        model = model.to(Config.device)
-        model.eval()
-        return model
-
-    # Fallback to runtime directory if currently running training loops
-    runtime_weights = Config.plots_dir / "GNN" / "best_gine_model.pt"
-    if runtime_weights.exists():
-        model.load_state_dict(torch.load(runtime_weights, map_location=Config.device))
-        model = model.to(Config.device)
-        model.eval()
-        return model
-
-    print("Warning: Model weight loading checkpoint bypassed. Uninitialized states present.")
-    return model
-
-
-def _load_y_scaler() -> Optional[StandardScaler]:
-    """Production look-up tracking down the fit target scaler file cleanly."""
-    import joblib
-
-    # First, look inside your fixed production directory
-    prod_scaler = Config.PRODUCTION_DIR / "fitted_scaler.pkl"
-    if prod_scaler.exists():
-        return joblib.load(prod_scaler)
-
-    # Fallback: Check the most recent runtime plots_dir if a training run just completed
-    runtime_scaler = Config.plots_dir / "GNN" / "fitted_scaler.pkl"
-    if runtime_scaler.exists():
-        return joblib.load(runtime_scaler)
-
-    print("Warning: Target StandardScaler lookup failed. Outputs will remain unscaled.")
-    return None
-
-def _load_global_scaler() -> Optional[StandardScaler]:
-    """Loads the pre-fit global descriptor StandardScaler from disk."""
-    prod_scaler = Config.PRODUCTION_DIR / "global_descriptor_scaler.pkl"
-    if prod_scaler.exists():
-        return joblib.load(prod_scaler)
-
-    runtime_scaler = Config.plots_dir / "GNN" / "global_descriptor_scaler.pkl"
-    if runtime_scaler.exists():
-        return joblib.load(runtime_scaler)
-    return None
-
-def predict_pic50_from_smiles(smiles: str, model: Optional[nn.Module] = None, scaler: Optional[StandardScaler] = None) -> float:
-    if not smiles or not isinstance(smiles, str):
-        raise ValueError("smiles must be a non-empty string")
-
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError("Invalid SMILES: cannot parse")
-
-    # Compute raw properties
-    try:
-        heavy_atoms = float(mol.GetNumHeavyAtoms())
-    except Exception:
-        heavy_atoms = 0.0
-
-    try:
-        mw = Descriptors.MolWt(mol)
-        logp = Descriptors.MolLogP(mol)
-        hbd = Descriptors.NumHDonors(mol)
-        hba = Descriptors.NumHAcceptors(mol)
-        lip_viol = float(int((mw > 500)) + int((logp > 5)) + int((hbd > 5)) + int((hba > 10)))
-    except Exception:
-        lip_viol = 0.0
-
-    # FIXED: Load and apply the descriptor scaling transformation matrix
-    scaler_g = _load_global_scaler()
-    if scaler_g is not None:
-        # Scale features using training set distribution parameters
-        scaled_features = scaler_g.transform([[heavy_atoms, lip_viol]])[0]
-        g_desc = [float(scaled_features[0]), float(scaled_features[1])]
-    else:
-        print("Warning: global descriptor scaler missing. Using unscaled macro features.")
-        g_desc = [heavy_atoms, lip_viol]
-
-    # Build Data object using properly scaled features
-    data = smiles_to_advanced_graph(smiles, 0.0, g_desc)
-    if data is None:
-        raise RuntimeError("Failed to build graph from SMILES")
-
-    data.batch = torch.zeros(data.x.size(0), dtype=torch.long)
-
-    if model is None:
-        model = load_trained_gnn(in_channels=data.x.size(1))
-
-    scaler_y = scaler if scaler is not None else _load_y_scaler()
-
-    model.eval()
-    with torch.no_grad():
-        out = model(data.to(next(model.parameters()).device))
-        pred = float(out.detach().cpu().item())
-
-    if scaler_y is not None:
-        try:
-            p = scaler_y.inverse_transform(np.array([[pred]])).flatten()[0]
-            return float(p)
-        except Exception:
-            pass
-
-    return float(pred)
-
-if __name__ == "__main__":
-    PARQUET_PATH = "data/eda_ready.parquet"
-    if os.path.exists(PARQUET_PATH):
-        raw_df = pd.read_parquet(PARQUET_PATH)
-        run_full_eda(raw_df)
-        run_training_pipeline(raw_df)
-    else:
-        print(f"File verification checkpoint failed: {PARQUET_PATH} missing.")
+PARQUET_PATH = "data/eda_ready.parquet"
+if os.path.exists(PARQUET_PATH):
+    raw_df = pd.read_parquet(PARQUET_PATH)
+    pipeline_progress = st.progress(0)
+    pipeline_status = st.empty()
+    update_progress(pipeline_progress, pipeline_status, 0.0, "Pipeline started")
+    run_full_eda(raw_df, progress_bar=pipeline_progress, status_placeholder=pipeline_status, start_fraction=0.0, end_fraction=0.3)
+    run_training_pipeline(raw_df, progress_bar=pipeline_progress, status_placeholder=pipeline_status, start_fraction=0.3, end_fraction=1.0)
+    update_progress(pipeline_progress, pipeline_status, 1.0, "Pipeline finished")
+else:
+    st.write(f"File verification checkpoint failed: {PARQUET_PATH} missing.")
