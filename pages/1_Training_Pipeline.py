@@ -22,6 +22,8 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GINEConv, global_mean_pool, global_max_pool, JumpingKnowledge
 
+from pipeline.Config import PROJECT_ROOT
+
 
 st.set_page_config(page_title="GINE Training Pipeline")
 st.sidebar.header("GINE Training Pipeline")
@@ -48,12 +50,10 @@ class Config:
     weight_decay = 8e-4
     early_stopping_patience = 10
 
-    # ADDED: Static fallback directory for the production deployment
-    PRODUCTION_DIR = Path("plots/production").resolve()
+    PRODUCTION_DIR = PROJECT_ROOT / "plots" / "production"
 
-    # Dynamic folder generator strictly for fresh training sessions
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plots_dir = Path("plots").resolve() / "runs" / timestamp
+    plots_dir = PROJECT_ROOT / "plots" / "runs" / timestamp
 
 def setup_dirs():
     Config.plots_dir.mkdir(parents=True, exist_ok=True)
@@ -458,8 +458,8 @@ def calculate_virtual_auc(model, loader, device, scaler_y, activity_threshold=7.
 
 
 PARQUET_PATH = "data/eda_ready.parquet"
-if os.path.exists(PARQUET_PATH):
-    raw_df = pd.read_parquet(PARQUET_PATH)
+if os.path.exists(PROJECT_ROOT / "data" / "eda_ready.parquet"):
+    raw_df = pd.read_parquet(PROJECT_ROOT / "data" / "eda_ready.parquet")
     pipeline_progress = st.progress(0)
     pipeline_status = st.empty()
     update_progress(pipeline_progress, pipeline_status, 0.0, "Pipeline started")

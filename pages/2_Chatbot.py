@@ -1,37 +1,35 @@
 import os
-import random
-import time
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import streamlit as st
 import torch
 from dotenv import load_dotenv
-from rdkit import Chem
-from rdkit.Chem import Draw, AllChem
+from rdkit.Chem import AllChem
 
-from pipelinev2 import predict_pic50_from_smiles
+from pipeline.Config import PROJECT_ROOT
+from pipelinev2 import predict_pic50_from_smiles, smiles_to_graph, compute_atom_explainability
 
 
 @st.cache_resource
 def load_llm_router():
     from transformers import pipeline
 
-    LOCAL_DIR = "./local_bart_router"
+    LOCAL_DIR = PROJECT_ROOT / "local_bart_router"
 
-    # Verify the files exist before loading
-    if not os.path.exists(LOCAL_DIR) or not os.listdir(LOCAL_DIR):
+    if not LOCAL_DIR.exists() or not any(LOCAL_DIR.iterdir()):
         raise FileNotFoundError(
             f"Local router path '{LOCAL_DIR}' is empty. Run 'hf_download.py' first!"
         )
 
     print(f"Loading Zero-Shot Classifier directly from local disk space: {LOCAL_DIR}")
 
-    # Point BOTH the model and tokenizer directly to your offline local folder path
     classifier = pipeline(
         "zero-shot-classification",
-        model=LOCAL_DIR,
-        tokenizer=LOCAL_DIR,
+        model=str(LOCAL_DIR),
+        tokenizer=str(LOCAL_DIR),
         device=0 if torch.cuda.is_available() else -1
     )
     return classifier
@@ -42,16 +40,12 @@ llm_router = load_llm_router()
 
 @st.cache_resource
 def load_cached_gnn():
-    """
-    Loads and caches the compiled model framework and its corresponding
-    y-target StandardScaler serialization objects cleanly from disk space.
-    """
-    from pipelinev2 import load_trained_gnn, _load_y_scaler
+    from pipelinev2 import load_model, _load_y_scaler
 
-    # 1. Load your GNN model using your 34-atom advanced channel dimension
-    model = load_trained_gnn(in_channels=34)
+    # Load GNN model using 34-atom features
+    model = load_model(in_channels=34)
 
-    # 2. Extract your production fitted scaler binary matrix
+    # Extract scaler
     scaler_y = _load_y_scaler()
 
     return model, scaler_y
@@ -60,18 +54,12 @@ def load_cached_gnn():
 gnn_model, target_scaler = load_cached_gnn()
 
 def run_gnn_prediction(smiles: str) -> float:
-    """
-    Executes a continuous forward-pass prediction leveraging the pre-loaded
-    global GNN network state and target scaling transforms.    """
     # Use the high-level method from pipelinev2 that already handles inference safely
     return predict_pic50_from_smiles(smiles, model=gnn_model, scaler=target_scaler)
 
 
+# Tokenize and extract valid SMILES strings from user input using RDKit's parsing capabilities
 def extract_smiles(text: str) -> Optional[str]:
-    """
-    Robust tokenizer that extracts valid chemical structural features
-    from natural language sentences.
-    """
     # Clean text and split by common delimiters
     clean_text = text.replace(",", " ").replace(";", " ").replace('"', " ").replace("'", " ")
     tokens = clean_text.split()
@@ -110,17 +98,50 @@ def generate_molecule_image(smiles: str) -> Optional[BytesIO]:
     return buf
 
 
-def response_generator():
-    response = random.choice(
-        [
-            "Hello there! How can I assist you today?",
-            "Hi, human! Is there anything I can help you with?",
-            "Do you need help?",
-        ]
+from io import BytesIO
+from matplotlib import cm
+from rdkit import Chem
+from rdkit.Chem import Draw
+
+# Renders a 2D molecule visualization and highlights key atoms driving model prediction
+def generate_explainable_molecule_image(smiles: str, atom_weights: Optional[np.ndarray] = None) -> BytesIO:
+    mol = Chem.MolFromSmiles(smiles)
+    Chem.AllChem.Compute2DCoords(mol)
+
+    highlight_atoms = []
+    highlight_colors = {}
+
+    if atom_weights is not None and len(atom_weights) == mol.GetNumAtoms():
+        # Map attribution ranges directly to a Matplotlib colormap (e.g., 'Reds' or 'Oranges')
+        colormap = cm.get_cmap('Reds')
+
+        for idx, weight in enumerate(atom_weights):
+            if weight > 0.3:  # Focus highlights strictly on meaningful attribution nodes
+                highlight_atoms.append(idx)
+                # Fetch RGB tuple values and assign them to the RDKit index mapping
+                rgba = colormap(weight)
+                highlight_colors[idx] = (rgba[0], rgba[1], rgba[2])
+
+    # Construct production-grade drawing canvas layout
+    drawer = Draw.MolDraw2DCairo(350, 350)
+
+    # Inject drawing specifications safely
+    draw_options = drawer.drawOptions()
+    draw_options.prepareMolsBeforeDrawing = True
+
+    drawer.DrawMolecule(
+        mol,
+        highlightAtoms=highlight_atoms,
+        highlightAtomColors=highlight_colors,
+        highlightBonds=None
     )
-    for word in response.split():
-        yield word + " "
-        time.sleep(0.05)
+    drawer.FinishDrawing()
+
+    # Stream binary payload array safely back to Streamlit
+    buf = BytesIO(drawer.GetDrawingText())
+    buf.seek(0)
+    return buf
+
 
 st.set_page_config(page_title="Chatbot")
 st.sidebar.header("Chatbot")
@@ -150,7 +171,6 @@ if user_prompt := st.chat_input("Ask a question or input a SMILES (e.g., c1ccccc
     detected_smiles = extract_smiles(user_prompt)
 
     # Execution path routing logic
-    # Execution path routing logic
     with st.chat_message("assistant"):
         # Initialize response placeholder to guarantee scope safety across all routes
         response = ""
@@ -161,23 +181,29 @@ if user_prompt := st.chat_input("Ask a question or input a SMILES (e.g., c1ccccc
 
                 with st.spinner("Assembling molecular graph and computing binding metrics..."):
                     try:
+                        # Fetch raw graph target structures
+                        g_desc = [0.0, 0.0] # Reconstructed placeholder descriptors logic matching pipelinev2
+                        graph_data = smiles_to_graph(detected_smiles, 0.0, g_desc)
+
+                        # Extract explanation attribution scores
+                        atom_weights = compute_atom_explainability(gnn_model, graph_data)
+
+                        # Predict the raw potency
                         pIC50 = run_gnn_prediction(detected_smiles)
                         ic50_nm = 10 ** (9 - pIC50)
 
-                        mol_bytes = generate_molecule_image(detected_smiles)
+                        # Draw the heat-mapped 2D structural diagram
+                        mol_bytes = generate_explainable_molecule_image(detected_smiles, atom_weights=atom_weights)
 
-                        # CHANGED: Assigned directly to 'response' instead of 'response_text'
                         response = f"""
-                        ### 📊 GNN Inference Matrix Complete:
-                        * **Target Protein Profile:** Serine/threonine-protein kinase Pim-1 (`CHEMBL2147`)
+                        ### 📊 GNN Inference Complete:
                         * **Predicted Potency ($pIC_{{50}}$):** `{pIC50:.3f}`
                         * **Estimated $IC_{{50}}$ Value:** `{ic50_nm:.2f} nM`
                         """
                         st.markdown(response)
 
-                        # Append the physical 2D image structural layout directly to the chat bubble
                         if mol_bytes:
-                            st.image(mol_bytes, caption=f"2D Topological Mapping: {detected_smiles}", use_container_width=False)
+                            st.image(mol_bytes, caption="XAI Heatmap: Highlighted regions display structural groups driving this prediction.")
 
                     except Exception as e:
                         response = f"Graph parsing error encountered during target tensor compilation: {str(e)}"
@@ -190,5 +216,4 @@ if user_prompt := st.chat_input("Ask a question or input a SMILES (e.g., c1ccccc
             response = "I recognized this request as a general conversation query. As a dedicated Pim-1 screening agent, you can prompt me with specific molecular configurations to tap into my GNN prediction architecture."
             st.markdown(response)
 
-    # This will now execute perfectly for all conditions without scoping gaps
     st.session_state.messages.append({"role": "assistant", "content": response})
